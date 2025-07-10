@@ -23,6 +23,7 @@ dist-ssr
 *.csv
 parse-uszips.cjs
 src/data/zipCodeDatabase.ts
+public/data/zipCodeDatabase.json
 
 # Editor directories and files
 .vscode/*

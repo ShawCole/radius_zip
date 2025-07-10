@@ -9,7 +9,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Copy, MapPin } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
-import { zipCodeDatabase, databaseStats, type ZipCodeData } from '@/data/zipCodeDatabase';
+import { loadZipCodeDatabase, type ZipCodeData, type DatabaseStats } from '@/data/zipCodeDatabase';
 
 const MapContainer = () => {
   const mapContainer = useRef<HTMLDivElement>(null);
@@ -29,7 +29,36 @@ const MapContainer = () => {
     distance: number;
   } | null>(null);
   const [forceViewportMode, setForceViewportMode] = useState<'auto' | 'single' | 'split'>('auto');
+  const [zipCodeDatabase, setZipCodeDatabase] = useState<ZipCodeData[]>([]);
+  const [databaseStats, setDatabaseStats] = useState<DatabaseStats>({
+    totalZipCodes: 0,
+    generatedAt: '',
+    avgPopulation: 0,
+    totalPopulation: 0,
+    states: 0,
+    counties: 0
+  });
   const { toast } = useToast();
+
+  // Load zip code database on component mount
+  useEffect(() => {
+    const loadDatabase = async () => {
+      try {
+        const data = await loadZipCodeDatabase();
+        setZipCodeDatabase(data.zipCodes);
+        setDatabaseStats(data.stats);
+      } catch (error) {
+        console.error('Failed to load zip code database:', error);
+        toast({
+          title: "Database Error",
+          description: "Failed to load zip code database. Please refresh the page.",
+          variant: "destructive"
+        });
+      }
+    };
+
+    loadDatabase();
+  }, [toast]);
 
   // Calculate the split line for multiple viewports
   const calculateViewportSplit = (seeds: Array<{ zipCode: string; lat: number; lng: number }>, overrideMode?: 'auto' | 'single' | 'split') => {
@@ -126,20 +155,17 @@ const MapContainer = () => {
       const container = mapRefs.current[index];
       if (!container || !mapboxToken) return;
 
-      // Use consistent zoom calculation
-      const zoom = calculateZoomLevel([seed], radius[0]);
-
       const newMap = new mapboxgl.Map({
         container: container,
         style: 'mapbox://styles/mapbox/light-v11',
         center: [seed.lng, seed.lat],
-        zoom: zoom
+        zoom: 9 // Initial zoom, will be adjusted after visualization
       });
 
       newMap.addControl(new mapboxgl.NavigationControl(), 'top-right');
       maps.current[index] = newMap;
 
-      // Add seed marker
+      // Add seed label only (no large marker dot)
       newMap.on('load', () => {
         const colors = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
         const color = colors[index % colors.length];
@@ -157,18 +183,6 @@ const MapContainer = () => {
         });
 
         newMap.addLayer({
-          id: `seed-marker-${index}`,
-          type: 'circle',
-          source: `seed-marker-${index}`,
-          paint: {
-            'circle-radius': 12,
-            'circle-color': color,
-            'circle-stroke-color': '#ffffff',
-            'circle-stroke-width': 3
-          }
-        });
-
-        newMap.addLayer({
           id: `seed-label-${index}`,
           type: 'symbol',
           source: `seed-marker-${index}`,
@@ -176,8 +190,8 @@ const MapContainer = () => {
             'text-field': ['get', 'zipCode'],
             'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
             'text-size': 14,
-            'text-offset': [0, 2],
-            'text-anchor': 'top'
+            'text-offset': [0, 0],
+            'text-anchor': 'center'
           },
           paint: {
             'text-color': color,
@@ -189,32 +203,37 @@ const MapContainer = () => {
     });
   };
 
-  // Calculate appropriate zoom level based on seeds and radius
-  const calculateZoomLevel = (seeds: Array<{ zipCode: string; lat: number; lng: number }>, radiusInMiles: number) => {
-    let maxDistance = 0;
+  // Calculate appropriate zoom level and bounds to show all circles completely
+  const calculateMapBounds = (seeds: Array<{ zipCode: string; lat: number; lng: number }>, radiusInMiles: number) => {
+    if (seeds.length === 0) return null;
 
-    // Calculate max distance between seeds (0 if only one seed)
-    if (seeds.length > 1) {
-      maxDistance = Math.max(...seeds.map((seed1, i) =>
-        Math.max(...seeds.slice(i + 1).map(seed2 =>
-          calculateDistance(seed1.lat, seed1.lng, seed2.lat, seed2.lng)
-        ))
-      ));
-    }
+    // Convert radius from miles to degrees (approximate)
+    const radiusInDegrees = radiusInMiles / 69; // Rough conversion: 1 degree ≈ 69 miles
 
-    // For single seed, totalViewDistance is just the radius diameter
-    // For multiple seeds, include the distance between them
-    const totalViewDistance = maxDistance + (radiusInMiles * 2);
+    // Find the bounding box that includes all circles
+    let minLat = Infinity, maxLat = -Infinity;
+    let minLng = Infinity, maxLng = -Infinity;
 
-    let zoom = 10;
-    if (totalViewDistance < 10) zoom = 12;
-    else if (totalViewDistance < 25) zoom = 10;
-    else if (totalViewDistance < 50) zoom = 9;
-    else if (totalViewDistance < 100) zoom = 8;
-    else zoom = 7;
+    seeds.forEach(seed => {
+      // Each circle extends radius in all directions from the seed
+      minLat = Math.min(minLat, seed.lat - radiusInDegrees);
+      maxLat = Math.max(maxLat, seed.lat + radiusInDegrees);
+      minLng = Math.min(minLng, seed.lng - radiusInDegrees);
+      maxLng = Math.max(maxLng, seed.lng + radiusInDegrees);
+    });
 
-    console.log(`Calculated zoom: ${zoom} for total distance ${totalViewDistance} (maxDistance: ${maxDistance}, radius: ${radiusInMiles})`);
-    return zoom;
+    // Add some padding (10% of the range)
+    const latRange = maxLat - minLat;
+    const lngRange = maxLng - minLng;
+    const padding = 0.1;
+
+    return {
+      bounds: [
+        [minLng - lngRange * padding, minLat - latRange * padding], // Southwest
+        [maxLng + lngRange * padding, maxLat + latRange * padding]  // Northeast
+      ],
+      center: [(minLng + maxLng) / 2, (minLat + maxLat) / 2]
+    };
   };
 
   // Initialize single map for close seeds
@@ -238,20 +257,17 @@ const MapContainer = () => {
     const avgLat = seeds.reduce((sum, seed) => sum + seed.lat, 0) / seeds.length;
     const avgLng = seeds.reduce((sum, seed) => sum + seed.lng, 0) / seeds.length;
 
-    // Use the same zoom calculation as updateMapZoomForRadius
-    const zoom = calculateZoomLevel(seeds, radius[0]);
-
     const newMap = new mapboxgl.Map({
       container: container,
       style: 'mapbox://styles/mapbox/light-v11',
       center: [avgLng, avgLat],
-      zoom: zoom
+      zoom: 9 // Initial zoom, will be adjusted after visualization
     });
 
     newMap.addControl(new mapboxgl.NavigationControl(), 'top-right');
     maps.current[0] = newMap;
 
-    // Add markers for all seeds
+    // Add labels for all seeds (no large marker dots)
     newMap.on('load', () => {
       const colors = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
 
@@ -271,18 +287,6 @@ const MapContainer = () => {
         });
 
         newMap.addLayer({
-          id: `seed-marker-${index}`,
-          type: 'circle',
-          source: `seed-marker-${index}`,
-          paint: {
-            'circle-radius': 12,
-            'circle-color': color,
-            'circle-stroke-color': '#ffffff',
-            'circle-stroke-width': 3
-          }
-        });
-
-        newMap.addLayer({
           id: `seed-label-${index}`,
           type: 'symbol',
           source: `seed-marker-${index}`,
@@ -290,8 +294,8 @@ const MapContainer = () => {
             'text-field': ['get', 'zipCode'],
             'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
             'text-size': 14,
-            'text-offset': [0, 2],
-            'text-anchor': 'top'
+            'text-offset': [0, 0],
+            'text-anchor': 'center'
           },
           paint: {
             'text-color': color,
@@ -333,6 +337,13 @@ const MapContainer = () => {
 
   // Function to get coordinates for a zip code using Mapbox Geocoding API
   const getZipCodeCoordinates = async (zipCode: string): Promise<{ lat: number; lng: number } | null> => {
+    // First try to find coordinates in local database
+    const localResult = zipCodeDatabase.find(z => z.zipCode === zipCode);
+    if (localResult) {
+      return { lat: localResult.lat, lng: localResult.lng };
+    }
+
+    // If not found locally, fall back to Mapbox API
     try {
       const response = await fetch(
         `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(zipCode)}.json?access_token=${mapboxToken}&types=postcode&country=US`
@@ -368,34 +379,46 @@ const MapContainer = () => {
     return R * c;
   };
 
-  // Update map zoom to fit radius circles
-  const updateMapZoomForRadius = (radiusInMiles: number) => {
-    if (seedCoordinates.length === 0) return;
+  // Update map to fit all radius circles completely
+  const fitMapToCircles = (seeds: Array<{ zipCode: string; lat: number; lng: number }>, radiusInMiles: number) => {
+    if (seeds.length === 0) return;
 
-    console.log(`Updating zoom for radius: ${radiusInMiles} miles`);
-    const split = calculateViewportSplit(seedCoordinates);
+    const bounds = calculateMapBounds(seeds, radiusInMiles);
+    if (!bounds) return;
+
+    console.log(`Fitting map to show all circles for radius: ${radiusInMiles} miles`);
+    const split = calculateViewportSplit(seeds);
 
     if (split && split.useSingleMap) {
-      // Single map - use consistent zoom calculation
+      // Single map - fit to show all circles
       const mapInstance = maps.current[0];
       if (mapInstance && mapInstance.isStyleLoaded()) {
-        const zoom = calculateZoomLevel(seedCoordinates, radiusInMiles);
-        console.log(`Single map: updating zoom to ${zoom}`);
-        mapInstance.easeTo({ zoom: zoom, duration: 500 });
+        console.log(`Single map: fitting bounds`, bounds.bounds);
+        mapInstance.fitBounds(bounds.bounds as [[number, number], [number, number]], {
+          padding: 50,
+          duration: 800,
+          essential: true
+        });
       } else if (mapInstance) {
         // If map isn't loaded yet, wait and try again
-        mapInstance.on('styledata', () => updateMapZoomForRadius(radiusInMiles));
+        mapInstance.on('styledata', () => fitMapToCircles(seeds, radiusInMiles));
       }
     } else {
-      // Multiple maps - update zoom for each based on radius
+      // Multiple maps - fit each to its individual circle
       maps.current.forEach((mapInstance, index) => {
-        if (mapInstance && mapInstance.isStyleLoaded()) {
-          const zoom = calculateZoomLevel([seedCoordinates[index]], radiusInMiles);
-          console.log(`Map ${index}: updating zoom to ${zoom} for radius ${radiusInMiles}`);
-          mapInstance.easeTo({ zoom: zoom, duration: 500 });
+        if (mapInstance && mapInstance.isStyleLoaded() && seeds[index]) {
+          const individualBounds = calculateMapBounds([seeds[index]], radiusInMiles);
+          if (individualBounds) {
+            console.log(`Map ${index}: fitting bounds for ${seeds[index].zipCode}`, individualBounds.bounds);
+            mapInstance.fitBounds(individualBounds.bounds as [[number, number], [number, number]], {
+              padding: 30,
+              duration: 800,
+              essential: true
+            });
+          }
         } else if (mapInstance) {
           // If map isn't loaded yet, wait and try again
-          mapInstance.on('styledata', () => updateMapZoomForRadius(radiusInMiles));
+          mapInstance.on('styledata', () => fitMapToCircles(seeds, radiusInMiles));
         }
       });
     }
@@ -571,14 +594,11 @@ const MapContainer = () => {
 
           setTimeout(() => {
             addRadiusVisualization(seedCoordinates, radius[0], zipCodesInRadius);
-
-            // Ensure zoom is correct for current radius
-            setTimeout(() => {
-              updateMapZoomForRadius(radius[0]);
-            }, 500);
-          }, 1000);
+            // Fit map to show all circles immediately after adding visualization
+            fitMapToCircles(seedCoordinates, radius[0]);
+          }, 300);
         }
-      }, 100);
+      }, 50);
     } else {
       // If no seeds, just initialize default map
       setTimeout(() => {
@@ -621,6 +641,15 @@ const MapContainer = () => {
       toast({
         title: "Missing Information",
         description: "Please enter at least one zip code.",
+        variant: "destructive"
+      });
+      return;
+    }
+
+    if (zipCodeDatabase.length === 0) {
+      toast({
+        title: "Database Loading",
+        description: "Zip code database is still loading. Please wait a moment and try again.",
         variant: "destructive"
       });
       return;
@@ -710,13 +739,10 @@ const MapContainer = () => {
         // Add radius visualization after maps are loaded
         setTimeout(() => {
           addRadiusVisualization(newSeedCoordinates, radiusInMiles, zipCodesInRadius);
-
-          // Ensure zoom is set correctly for current radius after maps are fully loaded
-          setTimeout(() => {
-            updateMapZoomForRadius(radiusInMiles);
-          }, 500);
-        }, 1000);
-      }, 100);
+          // Fit map to show all circles immediately after adding visualization
+          fitMapToCircles(newSeedCoordinates, radiusInMiles);
+        }, 300);
+      }, 50);
 
       // Calculate total population of found zip codes
       const totalPopulation = zipCodesInRadius.reduce((sum, zip) => sum + zip.population, 0);
@@ -774,9 +800,9 @@ const MapContainer = () => {
   }
 
   return (
-    <div className="h-screen flex bg-gray-50">
+    <div className="h-screen flex bg-gray-50 overflow-hidden">
       {/* Sidebar */}
-      <div className="w-80 bg-white shadow-lg flex flex-col">
+      <div className="w-80 bg-white shadow-lg flex flex-col h-full overflow-y-auto">
         <div className="p-6 border-b">
           <h1 className="text-2xl font-bold text-gray-900 mb-2">Zip Code Radius Tool</h1>
           <p className="text-gray-600 text-sm">Find ALL zip codes within a radius of one or more seed locations</p>
@@ -852,7 +878,7 @@ const MapContainer = () => {
         </div>
 
         {foundZipCodes.length > 0 && (
-          <div className="flex-1 p-6 pt-0">
+          <div className="p-6 pt-0">
             <Card>
               <CardHeader className="pb-3">
                 <CardTitle className="text-lg">Found Zip Codes ({foundZipCodes.length})</CardTitle>
@@ -861,10 +887,21 @@ const MapContainer = () => {
                 </p>
               </CardHeader>
               <CardContent>
-                <div className="bg-gray-50 p-3 rounded-md mb-3 max-h-40 overflow-y-auto">
-                  <p className="text-sm font-mono break-all">
-                    {foundZipCodes.join(', ')}
-                  </p>
+                <div className="bg-gray-50 px-0 py-2 rounded-md mb-3 max-h-40 overflow-y-auto">
+                  <div className="text-sm font-mono whitespace-pre-line">
+                    {foundZipCodes.map((zipCode, index) => {
+                      const isLastInGroup = (index + 1) % 4 === 0;
+                      const isLastOverall = index === foundZipCodes.length - 1;
+                      const isLastInLine = isLastInGroup || isLastOverall;
+
+                      return (
+                        <span key={zipCode}>
+                          {zipCode}
+                          {!isLastOverall && (isLastInLine ? '\n' : ', ')}
+                        </span>
+                      );
+                    })}
+                  </div>
                 </div>
 
                 {/* Population Summary */}
@@ -896,7 +933,7 @@ const MapContainer = () => {
       </div>
 
       {/* Map */}
-      <div className="flex-1 relative">
+      <div className="flex-1 relative h-full overflow-hidden">
         {seedCoordinates.length === 0 ? (
           // Default map view with instructional overlay
           <div className="absolute inset-0">
