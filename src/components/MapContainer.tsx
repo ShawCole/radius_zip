@@ -27,6 +27,7 @@ const MapContainer = () => {
     angle?: number;
     splitPercentage?: number;
     distance: number;
+    clusters?: Array<Array<{ zipCode: string; lat: number; lng: number }>>;
   } | null>(null);
   const [forceViewportMode, setForceViewportMode] = useState<'auto' | 'single' | 'split'>('auto');
   const [zipCodeDatabase, setZipCodeDatabase] = useState<ZipCodeData[]>([]);
@@ -60,6 +61,69 @@ const MapContainer = () => {
     loadDatabase();
   }, [toast]);
 
+  // Helper function to cluster nearby seeds
+  const clusterNearbySeeds = (seeds: Array<{ zipCode: string; lat: number; lng: number }>, maxDistance: number) => {
+    const clusters: Array<Array<{ zipCode: string; lat: number; lng: number }>> = [];
+    const used = new Set<number>();
+
+    for (let i = 0; i < seeds.length; i++) {
+      if (used.has(i)) continue;
+
+      const cluster = [seeds[i]];
+      used.add(i);
+
+      // Find all other seeds within maxDistance of any seed in this cluster
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (let j = 0; j < seeds.length; j++) {
+          if (used.has(j)) continue;
+
+          // Check if this seed is close to any seed in the current cluster
+          const isClose = cluster.some(clusterSeed => {
+            const distance = calculateDistance(
+              seeds[j].lat, seeds[j].lng,
+              clusterSeed.lat, clusterSeed.lng
+            );
+            return distance <= maxDistance;
+          });
+
+          if (isClose) {
+            cluster.push(seeds[j]);
+            used.add(j);
+            changed = true;
+          }
+        }
+      }
+
+      clusters.push(cluster);
+    }
+
+    return clusters;
+  };
+
+  // Helper function to get maximum distance within a cluster
+  const getMaxDistanceInCluster = (cluster: Array<{ zipCode: string; lat: number; lng: number }>) => {
+    let maxDistance = 0;
+    for (let i = 0; i < cluster.length; i++) {
+      for (let j = i + 1; j < cluster.length; j++) {
+        const distance = calculateDistance(
+          cluster[i].lat, cluster[i].lng,
+          cluster[j].lat, cluster[j].lng
+        );
+        maxDistance = Math.max(maxDistance, distance);
+      }
+    }
+    return maxDistance;
+  };
+
+  // Helper function to get the center point of a cluster
+  const getClusterCenter = (cluster: Array<{ zipCode: string; lat: number; lng: number }>) => {
+    const avgLat = cluster.reduce((sum, seed) => sum + seed.lat, 0) / cluster.length;
+    const avgLng = cluster.reduce((sum, seed) => sum + seed.lng, 0) / cluster.length;
+    return { lat: avgLat, lng: avgLng };
+  };
+
   // Calculate the split line for multiple viewports
   const calculateViewportSplit = (seeds: Array<{ zipCode: string; lat: number; lng: number }>, overrideMode?: 'auto' | 'single' | 'split') => {
     if (seeds.length === 0) return null;
@@ -78,6 +142,35 @@ const MapContainer = () => {
       if (currentMode === 'single') {
         return { useSingleMap: true, distance: 0 };
       }
+
+      // For auto mode with 3+ seeds, use intelligent clustering
+      if (currentMode === 'auto') {
+        // Cluster seeds that are within 30 miles of each other
+        const clusters = clusterNearbySeeds(seeds, 30);
+
+        // If all seeds form one cluster, use single map
+        if (clusters.length === 1) {
+          const maxDistance = getMaxDistanceInCluster(clusters[0]);
+          return { useSingleMap: true, distance: maxDistance };
+        }
+
+        // If exactly 2 clusters, use split view
+        if (clusters.length === 2) {
+          // Calculate distance between cluster centers for display
+          const center1 = getClusterCenter(clusters[0]);
+          const center2 = getClusterCenter(clusters[1]);
+          const distance = calculateDistance(center1.lat, center1.lng, center2.lat, center2.lng);
+
+          return {
+            useSingleMap: false,
+            angle: 0, // Will be calculated if needed
+            splitPercentage: 50,
+            distance,
+            clusters // Pass clusters for rendering
+          };
+        }
+      }
+
       // Otherwise use grid view (no split calculation needed)
       return { useSingleMap: false, distance: 0 };
     }
@@ -135,6 +228,79 @@ const MapContainer = () => {
       splitPercentage: 50, // Split in half
       distance
     };
+  };
+
+  // Initialize maps for clusters (intelligent split viewport)
+  const initializeClusterMaps = (clusters: Array<Array<{ zipCode: string; lat: number; lng: number }>>) => {
+    // Clean up existing maps safely
+    maps.current.forEach(map => {
+      if (map && typeof map.remove === 'function') {
+        try {
+          map.remove();
+        } catch (error) {
+          console.warn('Error removing map:', error);
+        }
+      }
+    });
+    maps.current = [];
+
+    clusters.forEach((cluster, clusterIndex) => {
+      const container = mapRefs.current[clusterIndex];
+      if (!container || !mapboxToken) return;
+
+      // Calculate center of cluster
+      const clusterCenter = getClusterCenter(cluster);
+
+      const newMap = new mapboxgl.Map({
+        container: container,
+        style: 'mapbox://styles/mapbox/light-v11',
+        center: [clusterCenter.lng, clusterCenter.lat],
+        zoom: 9 // Initial zoom, will be adjusted after visualization
+      });
+
+      newMap.addControl(new mapboxgl.NavigationControl(), 'top-right');
+      maps.current[clusterIndex] = newMap;
+
+      // Add labels for all seeds in this cluster
+      newMap.on('load', () => {
+        const colors = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
+
+        cluster.forEach((seed, seedIndex) => {
+          const colorIndex = (clusterIndex * 4 + seedIndex) % colors.length;
+          const color = colors[colorIndex];
+
+          newMap.addSource(`cluster-${clusterIndex}-seed-${seedIndex}`, {
+            type: 'geojson',
+            data: {
+              type: 'Feature',
+              properties: { zipCode: seed.zipCode },
+              geometry: {
+                type: 'Point',
+                coordinates: [seed.lng, seed.lat]
+              }
+            }
+          });
+
+          newMap.addLayer({
+            id: `cluster-${clusterIndex}-label-${seedIndex}`,
+            type: 'symbol',
+            source: `cluster-${clusterIndex}-seed-${seedIndex}`,
+            layout: {
+              'text-field': ['get', 'zipCode'],
+              'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+              'text-size': 14,
+              'text-offset': [0, 0],
+              'text-anchor': 'center'
+            },
+            paint: {
+              'text-color': color,
+              'text-halo-color': '#ffffff',
+              'text-halo-width': 2
+            }
+          });
+        });
+      });
+    });
   };
 
   // Initialize maps for each seed (split viewport)
@@ -404,23 +570,46 @@ const MapContainer = () => {
         mapInstance.on('styledata', () => fitMapToCircles(seeds, radiusInMiles));
       }
     } else {
-      // Multiple maps - fit each to its individual circle
-      maps.current.forEach((mapInstance, index) => {
-        if (mapInstance && mapInstance.isStyleLoaded() && seeds[index]) {
-          const individualBounds = calculateMapBounds([seeds[index]], radiusInMiles);
-          if (individualBounds) {
-            console.log(`Map ${index}: fitting bounds for ${seeds[index].zipCode}`, individualBounds.bounds);
-            mapInstance.fitBounds(individualBounds.bounds as [[number, number], [number, number]], {
-              padding: 30,
-              duration: 800,
-              essential: true
-            });
+      // Multiple maps - fit each to its seeds/cluster
+      const split = calculateViewportSplit(seeds);
+
+      if (split && split.clusters && split.clusters.length === 2) {
+        // Cluster-based split view - fit each map to its cluster
+        maps.current.forEach((mapInstance, clusterIndex) => {
+          if (mapInstance && mapInstance.isStyleLoaded() && split.clusters![clusterIndex]) {
+            const clusterSeeds = split.clusters![clusterIndex];
+            const clusterBounds = calculateMapBounds(clusterSeeds, radiusInMiles);
+            if (clusterBounds) {
+              console.log(`Cluster ${clusterIndex}: fitting bounds for ${clusterSeeds.map(s => s.zipCode).join(', ')}`, clusterBounds.bounds);
+              mapInstance.fitBounds(clusterBounds.bounds as [[number, number], [number, number]], {
+                padding: 30,
+                duration: 800,
+                essential: true
+              });
+            }
+          } else if (mapInstance) {
+            mapInstance.on('styledata', () => fitMapToCircles(seeds, radiusInMiles));
           }
-        } else if (mapInstance) {
-          // If map isn't loaded yet, wait and try again
-          mapInstance.on('styledata', () => fitMapToCircles(seeds, radiusInMiles));
-        }
-      });
+        });
+      } else {
+        // Individual seed maps - fit each to its individual circle
+        maps.current.forEach((mapInstance, index) => {
+          if (mapInstance && mapInstance.isStyleLoaded() && seeds[index]) {
+            const individualBounds = calculateMapBounds([seeds[index]], radiusInMiles);
+            if (individualBounds) {
+              console.log(`Map ${index}: fitting bounds for ${seeds[index].zipCode}`, individualBounds.bounds);
+              mapInstance.fitBounds(individualBounds.bounds as [[number, number], [number, number]], {
+                padding: 30,
+                duration: 800,
+                essential: true
+              });
+            }
+          } else if (mapInstance) {
+            // If map isn't loaded yet, wait and try again
+            mapInstance.on('styledata', () => fitMapToCircles(seeds, radiusInMiles));
+          }
+        });
+      }
     }
   };
 
@@ -582,7 +771,11 @@ const MapContainer = () => {
       setTimeout(() => {
         if (split && split.useSingleMap) {
           initializeSingleMap(seedCoordinates);
+        } else if (split && split.clusters && split.clusters.length === 2) {
+          // Use cluster-based split view for 2 clusters
+          initializeClusterMaps(split.clusters);
         } else {
+          // Use individual maps for each seed (grid view or regular split)
           initializeMaps(seedCoordinates);
         }
 
@@ -732,7 +925,11 @@ const MapContainer = () => {
       setTimeout(() => {
         if (split && split.useSingleMap) {
           initializeSingleMap(newSeedCoordinates);
+        } else if (split && split.clusters && split.clusters.length === 2) {
+          // Use cluster-based split view for 2 clusters
+          initializeClusterMaps(split.clusters);
         } else {
+          // Use individual maps for each seed (grid view or regular split)
           initializeMaps(newSeedCoordinates);
         }
 
@@ -887,17 +1084,17 @@ const MapContainer = () => {
                 </p>
               </CardHeader>
               <CardContent>
-                <div className="bg-gray-50 px-0 py-2 rounded-md mb-3 max-h-40 overflow-y-auto">
-                  <div className="text-sm font-mono whitespace-pre-line">
+                <div className="bg-gray-50 px-2 py-2 rounded-md mb-3 max-h-40 overflow-y-auto">
+                  <div className="text-sm font-mono whitespace-pre-line min-w-fit">
                     {foundZipCodes.map((zipCode, index) => {
                       const isLastInGroup = (index + 1) % 4 === 0;
                       const isLastOverall = index === foundZipCodes.length - 1;
-                      const isLastInLine = isLastInGroup || isLastOverall;
 
                       return (
                         <span key={zipCode}>
                           {zipCode}
-                          {!isLastOverall && (isLastInLine ? '\n' : ', ')}
+                          {!isLastOverall && ', '}
+                          {isLastInGroup && !isLastOverall && '\n'}
                         </span>
                       );
                     })}
@@ -978,8 +1175,8 @@ const MapContainer = () => {
               </div>
             </div>
           </div>
-        ) : seedCoordinates.length === 2 && mapSplit ? (
-          // Two seeds far apart - split view
+        ) : (mapSplit && !mapSplit.useSingleMap && ((seedCoordinates.length === 2) || (mapSplit.clusters && mapSplit.clusters.length === 2))) ? (
+          // Two seeds far apart OR two clusters - split view
           <div className="absolute inset-0">
             {/* Map containers */}
             <div className="absolute inset-0 flex">
@@ -991,7 +1188,11 @@ const MapContainer = () => {
                 <div className="absolute top-4 left-4 bg-white bg-opacity-90 px-3 py-2 rounded-md shadow-sm">
                   <div className="flex items-center gap-2">
                     <div className="w-3 h-3 bg-blue-500 rounded-full" />
-                    <span className="font-medium">{seedCoordinates[0]?.zipCode}</span>
+                    <span className="font-medium">
+                      {mapSplit?.clusters ?
+                        mapSplit.clusters[0]?.map(s => s.zipCode).join(', ') :
+                        seedCoordinates[0]?.zipCode}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -1003,7 +1204,11 @@ const MapContainer = () => {
                 <div className="absolute top-4 right-4 bg-white bg-opacity-90 px-3 py-2 rounded-md shadow-sm">
                   <div className="flex items-center gap-2">
                     <div className="w-3 h-3 bg-red-500 rounded-full" />
-                    <span className="font-medium">{seedCoordinates[1]?.zipCode}</span>
+                    <span className="font-medium">
+                      {mapSplit?.clusters ?
+                        mapSplit.clusters[1]?.map(s => s.zipCode).join(', ') :
+                        seedCoordinates[1]?.zipCode}
+                    </span>
                   </div>
                 </div>
               </div>
