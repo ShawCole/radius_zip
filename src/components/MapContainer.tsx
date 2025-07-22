@@ -9,7 +9,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Copy, MapPin } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
-import { loadZipCodeDatabase, type ZipCodeData, type DatabaseStats } from '@/data/zipCodeDatabase';
+import { loadZipCodeDatabase, type ZipCodeData, type DatabaseStats } from '@/data/zipCodeDatabase.ts';
 
 const MapContainer = () => {
   const mapContainer = useRef<HTMLDivElement>(null);
