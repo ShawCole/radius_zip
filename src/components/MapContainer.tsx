@@ -16,7 +16,7 @@ const MapContainer = () => {
   const map = useRef<mapboxgl.Map | null>(null);
   const mapRefs = useRef<(HTMLDivElement | null)[]>([]);
   const maps = useRef<(mapboxgl.Map | null)[]>([]);
-  const [mapboxToken] = useState(import.meta.env.VITE_MAPBOX_TOKEN || '');
+  const [mapboxToken] = useState(import.meta.env.VITE_MAPBOX_TOKEN || 'pk.eyJ1Ijoic2hhd2NvbGUiLCJhIjoiY21jcm95bzhnMHR4aDJqcTB5bm8zZTVhYSJ9.5t0L7sw1yXB8erVH-Lbg');
   const [seedZipCodes, setSeedZipCodes] = useState('');
   const [radius, setRadius] = useState([10]);
   const [foundZipCodes, setFoundZipCodes] = useState<string[]>([]);
