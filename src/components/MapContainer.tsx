@@ -10,6 +10,9 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Copy, MapPin } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { loadZipCodeDatabase, type ZipCodeData, type DatabaseStats } from '@/data/zipCodeDatabase.ts';
+import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/components/ui/accordion';
+import TriStateCheckbox, { type TriState } from '@/components/ui/tri-state-checkbox';
+import { STATES_AND_TERRITORIES } from '@/data/states';
 
 const MapContainer = () => {
   const mapContainer = useRef<HTMLDivElement>(null);
@@ -40,6 +43,97 @@ const MapContainer = () => {
     counties: 0
   });
   const { toast } = useToast();
+
+  // State filters
+  // draftStateFilters: what user is currently selecting in the UI
+  // appliedStateFilters: currently applied to results/map
+  const [draftStateFilters, setDraftStateFilters] = useState<Record<string, TriState>>({});
+  const [appliedStateFilters, setAppliedStateFilters] = useState<Record<string, TriState>>({});
+
+  // Base set of found zip codes from the last search (no filters applied)
+  const [baseFoundZipCodes, setBaseFoundZipCodes] = useState<string[]>([]);
+
+  const setTriState = (code: string, next: TriState) => {
+    setDraftStateFilters(prev => ({ ...prev, [code]: next }));
+  };
+
+  const clearDraftStateFilters = () => setDraftStateFilters({});
+
+  const compactFilters = (filters: Record<string, TriState>) => {
+    const result: Record<string, TriState> = {};
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== 'unset') result[k] = v;
+    });
+    return result;
+  };
+
+  const areFiltersEqual = (a: Record<string, TriState>, b: Record<string, TriState>) => {
+    const ca = compactFilters(a);
+    const cb = compactFilters(b);
+    const keys = new Set([...Object.keys(ca), ...Object.keys(cb)]);
+    for (const k of keys) {
+      if ((ca[k] || 'unset') !== (cb[k] || 'unset')) return false;
+    }
+    return true;
+  };
+
+  const appliedIsEmpty = Object.keys(compactFilters(appliedStateFilters)).length === 0;
+  const hasDraftChanges = !areFiltersEqual(draftStateFilters, appliedStateFilters);
+
+  const applyFiltersToListWith = (filters: Record<string, TriState>, list: string[]) => {
+    const includeStates = new Set(
+      Object.entries(filters)
+        .filter(([, v]) => v === 'include')
+        .map(([k]) => k)
+    );
+    const excludeStates = new Set(
+      Object.entries(filters)
+        .filter(([, v]) => v === 'exclude')
+        .map(([k]) => k)
+    );
+
+    if (includeStates.size === 0 && excludeStates.size === 0) return list;
+
+    return list.filter(zip => {
+      const z = zipCodeDatabase.find(d => d.zipCode === zip);
+      if (!z) return false;
+      if (excludeStates.has(z.state)) return false;
+      if (includeStates.size > 0) return includeStates.has(z.state);
+      return true;
+    });
+  };
+
+  const applyFiltersToList = (list: string[]) => applyFiltersToListWith(appliedStateFilters, list);
+
+  const refreshMapWithFoundZipCodes = (zipCodes: string[]) => {
+    const zipCodesData = zipCodes.map(z => zipCodeDatabase.find(d => d.zipCode === z)!).filter(Boolean);
+    addRadiusVisualization(seedCoordinates, radius[0], zipCodesData);
+  };
+
+  const handleApplyFilters = () => {
+    // Move draft -> applied and update results instantly
+    const next = compactFilters(draftStateFilters);
+    setAppliedStateFilters(next);
+    const filtered = applyFiltersToListWith(next, baseFoundZipCodes);
+    setFoundZipCodes(filtered);
+    // Update map markers
+    setTimeout(() => refreshMapWithFoundZipCodes(filtered), 0);
+  };
+
+  const handleResetFilters = () => {
+    setAppliedStateFilters({});
+    setDraftStateFilters({});
+    setFoundZipCodes(baseFoundZipCodes);
+    setTimeout(() => refreshMapWithFoundZipCodes(baseFoundZipCodes), 0);
+  };
+
+  // Keep the list and markers in sync if filters or base results change
+  useEffect(() => {
+    if (baseFoundZipCodes.length === 0) return;
+    const filtered = applyFiltersToList(baseFoundZipCodes);
+    setFoundZipCodes(filtered);
+    setTimeout(() => refreshMapWithFoundZipCodes(filtered), 0);
+  }, [appliedStateFilters, baseFoundZipCodes]);
 
   // Load zip code database on component mount
   useEffect(() => {
@@ -647,6 +741,27 @@ const MapContainer = () => {
       return coords;
     };
 
+    // Build include/exclude sets for seeds by state
+    const includeStates = new Set(
+      Object.entries(appliedStateFilters)
+        .filter(([, v]) => v === 'include')
+        .map(([k]) => k)
+    );
+    const excludeStates = new Set(
+      Object.entries(appliedStateFilters)
+        .filter(([, v]) => v === 'exclude')
+        .map(([k]) => k)
+    );
+
+    const isSeedAllowed = (zip: string) => {
+      const seedData = zipCodeDatabase.find(z => z.zipCode === zip);
+      const state = seedData?.state;
+      if (!state) return true; // if unknown, show
+      if (excludeStates.has(state)) return false;
+      if (includeStates.size > 0) return includeStates.has(state);
+      return true;
+    };
+
     maps.current.forEach((mapInstance, mapIndex) => {
       if (!mapInstance) return;
 
@@ -664,8 +779,9 @@ const MapContainer = () => {
         }
       });
 
-      // Add radius circles for all seeds
+      // Add radius circles for allowed seeds only
       const circleFeatures = seeds.map((seed, index) => {
+        const allowed = isSeedAllowed(seed.zipCode);
         const color = colors[index % colors.length];
         const circleCoords = createCircle([seed.lng, seed.lat], radiusInKm);
 
@@ -681,7 +797,7 @@ const MapContainer = () => {
             coordinates: [circleCoords]
           }
         };
-      });
+      }).filter((f, i) => isSeedAllowed(seeds[i].zipCode));
 
       mapInstance.addSource('radius-circles', {
         type: 'geojson',
@@ -699,6 +815,17 @@ const MapContainer = () => {
           'line-color': ['get', 'color'],
           'line-width': 2,
           'line-opacity': 0.8
+        }
+      });
+
+      // Toggle seed labels visibility according to allowed states (single-map ids)
+      seeds.forEach((seed, index) => {
+        const visible = isSeedAllowed(seed.zipCode) ? 'visible' : 'none';
+        const singleId = `seed-label-${index}`;
+        if (mapInstance.getLayer(singleId)) {
+          try {
+            mapInstance.setLayoutProperty(singleId, 'visibility', visible);
+          } catch { }
         }
       });
 
@@ -896,7 +1023,7 @@ const MapContainer = () => {
       const split = calculateViewportSplit(newSeedCoordinates);
       setMapSplit(split);
 
-      // Find zip codes within radius of each seed
+      // Find zip codes within radius of each seed (base results without filters)
       const radiusInMiles = radius[0];
       const allFoundZipCodes = new Set<string>();
       const zipCodeDetails = new Map<string, ZipCodeData>();
@@ -916,10 +1043,14 @@ const MapContainer = () => {
         });
       });
 
-      // Convert to array for further processing
+      // Convert to array (unfiltered base results)
       const zipCodesInRadius = Array.from(allFoundZipCodes).map(zipCode => zipCodeDetails.get(zipCode)!);
+      const baseList = zipCodesInRadius.map(z => z.zipCode);
+      setBaseFoundZipCodes(baseList);
 
-      setFoundZipCodes(zipCodesInRadius.map(z => z.zipCode));
+      // Apply currently applied filters to base list for visible results
+      const filteredList = applyFiltersToList(baseList);
+      setFoundZipCodes(filteredList);
 
       // Initialize maps based on distance between seeds
       setTimeout(() => {
@@ -935,14 +1066,19 @@ const MapContainer = () => {
 
         // Add radius visualization after maps are loaded
         setTimeout(() => {
-          addRadiusVisualization(newSeedCoordinates, radiusInMiles, zipCodesInRadius);
+          // Visualize filtered results
+          const filteredZipsData = filteredList.map(zipCode => zipCodeDetails.get(zipCode)!).filter(Boolean);
+          addRadiusVisualization(newSeedCoordinates, radiusInMiles, filteredZipsData);
           // Fit map to show all circles immediately after adding visualization
           fitMapToCircles(newSeedCoordinates, radiusInMiles);
         }, 300);
       }, 50);
 
       // Calculate total population of found zip codes
-      const totalPopulation = zipCodesInRadius.reduce((sum, zip) => sum + zip.population, 0);
+      const totalPopulation = filteredList
+        .map(z => zipCodeDetails.get(z)!)
+        .filter(Boolean)
+        .reduce((sum, zip) => sum + zip.population, 0);
 
       toast({
         title: "Search Complete!",
@@ -1036,6 +1172,52 @@ const MapContainer = () => {
               step={1}
               className="mt-2"
             />
+          </div>
+
+          {/* Include / Exclude by State */}
+          <div>
+            <Accordion type="single" collapsible>
+              <AccordionItem value="states">
+                <AccordionTrigger>Include / Exclude States</AccordionTrigger>
+                <AccordionContent>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs text-gray-500">Click to cycle: empty → include → exclude</span>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant={hasDraftChanges ? "default" : "outline"}
+                        size="sm"
+                        disabled={!hasDraftChanges}
+                        onClick={handleApplyFilters}
+                      >
+                        Apply
+                      </Button>
+                      <Button
+                        variant={appliedIsEmpty ? "outline" : "destructive"}
+                        size="sm"
+                        disabled={appliedIsEmpty}
+                        onClick={handleResetFilters}
+                      >
+                        Reset
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="max-h-64 overflow-y-auto pr-1">
+                    <ul className="space-y-2">
+                      {STATES_AND_TERRITORIES.map(({ code, name }) => (
+                        <li key={code} className="flex">
+                          <TriStateCheckbox
+                            state={draftStateFilters[code] || 'unset'}
+                            onToggle={(next) => setTriState(code, next)}
+                            label={`${name} (${code})`}
+                            className="w-full justify-start"
+                          />
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </AccordionContent>
+              </AccordionItem>
+            </Accordion>
           </div>
 
           <div>
